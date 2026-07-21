@@ -1,0 +1,34 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import { Icon } from "astro-icon/components";
+import { albums } from "../data/albums";
+import PhotoWallGrid from "../components/admin/PhotoWallGrid";
+
+const id = Astro.url.searchParams.get("id") || "";
+const album = id ? albums.find((a) => a.id === id) : null;
+---
+
+<BaseLayout title={album ? album.event : `照片集`} description={album?.description}>
+  <div class="mb-10" style={album ? `view-transition-name: album-${album.id}` : ""}>
+    <div class="mb-4">
+      <h1 class="text-3xl md:text-4xl font-bold flex items-center gap-3">
+        <Icon name="lucide:camera" class="text-primary" />
+        <span id="photo-wall-title">{album ? `${album.icon || ''} ${album.event}` : '照片集'}</span>
+      </h1>
+    </div>
+
+    <p id="photo-wall-description" class="text-base-content/70 text-lg mb-6">
+      {album ? album.title : (id ? '照片集' : '请从相册页面选择相册查看')}
+    </p>
+
+    <PhotoWallGrid
+      initialAlbum={album || null}
+      event={id}
+      client:only="react"
+    />
+  </div>
+
+  <div class="divider my-6">
+    <Icon name="lucide:heart" class="w-12 h-12 text-primary/50" />
+  </div>
+</BaseLayout>

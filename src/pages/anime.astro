@@ -1,0 +1,549 @@
+---
+import BaseLayout from "@layouts/BaseLayout.astro";
+import Card from "@components/temple/Card.astro";
+import { Icon } from "astro-icon/components";
+import { TMDB_CONFIG, BILIBILI_CONFIG } from "@config";
+import * as fs from "node:fs";
+import * as path from "node:path";
+
+const TMDB_IMG = "https://image.tmdb.org/t/p/w500";
+const TMDB_API_KEY = TMDB_CONFIG?.apiKey || import.meta.env.TMDB_API_KEY;
+const TMDB_LIST_ID = TMDB_CONFIG?.listId || "8556173";
+const BILIBILI_UID = BILIBILI_CONFIG?.uid;
+
+const fetchWithTimeout = async (url: string, options: any = {}, timeout = 10000) => {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+};
+
+let animeData: any[] = [];
+try {
+  const localPath = path.resolve("public/anime-list.json");
+  if (fs.existsSync(localPath)) {
+    animeData = JSON.parse(fs.readFileSync(localPath, "utf-8"));
+  }
+} catch {
+  console.warn("Local anime-list.json not found or invalid.");
+}
+
+// 并行获取 TMDB 和 Bilibili 数据
+let bilibiliItems: any[] = [];
+if (TMDB_API_KEY || BILIBILI_UID) {
+  const [tmdbResult, biliResult] = await Promise.all([
+    TMDB_API_KEY ? fetchTMDB() : Promise.resolve([]),
+    BILIBILI_UID ? fetchBilibili() : Promise.resolve([])
+  ]);
+  if (tmdbResult.length > 0) animeData = tmdbResult;
+  bilibiliItems = biliResult;
+}
+
+async function fetchTMDB(): Promise<any[]> {
+  console.log(`Fetching TMDB list: ${TMDB_LIST_ID}...`);
+  try {
+    const res = await fetchWithTimeout(
+      `https://api.themoviedb.org/3/list/${TMDB_LIST_ID}?api_key=${TMDB_API_KEY}&language=zh-CN&page=1`,
+      {},
+      10000
+    );
+    
+    if (!res.ok) {
+      console.error(`TMDB request failed: ${res.status}`);
+      return [];
+    }
+    
+    const data = await res.json();
+    const totalPages = data.total_pages || 1;
+    let allItems = [...(data.items || [])];
+    
+    if (totalPages > 1) {
+      const promises = Array.from({ length: totalPages - 1 }, (_, i) =>
+        fetchWithTimeout(
+          `https://api.themoviedb.org/3/list/${TMDB_LIST_ID}?api_key=${TMDB_API_KEY}&language=zh-CN&page=${i + 2}`,
+          {},
+          10000
+        )
+          .then(r => r.json())
+          .then(d => d.items || [])
+          .catch(() => [])
+      );
+      
+      const results = await Promise.all(promises);
+      results.forEach(items => allItems.push(...items));
+    }
+    
+    console.log(`TMDB fetched: ${allItems.length} items`);
+    return [{ ...data, items: allItems }];
+  } catch (e) {
+    console.error("TMDB fetch failed:", e);
+    return [];
+  }
+}
+
+async function fetchBilibili(): Promise<any[]> {
+  console.log(`Fetching Bilibili list for UID: ${BILIBILI_UID}...`);
+  const items: any[] = [];
+  let page = 1;
+  
+  while (page <= 20) {
+    try {
+      const res = await fetchWithTimeout(
+        `https://api.bilibili.com/x/space/bangumi/follow/list?type=1&vmid=${BILIBILI_UID}&pn=${page}&ps=30`,
+        {},
+        10000
+      );
+      
+      const json = await res.json();
+      if (!json.data?.list?.length) break;
+      
+      items.push(...json.data.list);
+      if (items.length >= json.data.total) break;
+      page++;
+    } catch (e) {
+      console.warn(`Bilibili page ${page} failed, stopping`);
+      break;
+    }
+  }
+  
+  console.log(`Bilibili fetched: ${items.length} items`);
+  return items;
+}
+
+// 确保 animeData 是数组（处理本地文件可能是单个对象的情况）
+if (!Array.isArray(animeData)) {
+  animeData = [animeData];
+}
+
+// 展平并标准化数据
+let animeList = animeData.flatMap((group) => group.items || []).map(anime => {
+  // 统一处理 TV 和 Movie 的字段差异
+  // Movie: title, original_title, release_date
+  // TV: name, original_name, first_air_date
+  const title = anime.title || anime.name || "";
+  const originalTitle = anime.original_title || anime.original_name || "";
+  const date = anime.release_date || anime.first_air_date || "";
+  const type = anime.media_type || 'tv';
+
+  return {
+    id: anime.id,
+    title: title,
+    originalTitle: originalTitle,
+    poster: anime.poster_path ? TMDB_IMG + anime.poster_path : null,
+    type: type,
+    source: 'tmdb',
+    rating: anime.vote_average || 0,
+    date: date,
+    overview: anime.overview,
+    link: `https://www.themoviedb.org/${type}/${anime.id}`,
+    epStatus: undefined
+  };
+});
+
+// 合并 Bilibili 数据
+if (bilibiliItems.length > 0) {
+  const bilibiliMapped = bilibiliItems.map(item => ({
+    id: item.media_id,
+    title: item.title,
+    originalTitle: item.title,
+    poster: item.cover ? item.cover.replace('http://', 'https://') : null,
+    type: item.season_type_name === '剧场版' || item.season_type_name === '电影' ? 'movie' : 'tv',
+    source: 'bilibili',
+    rating: item.rating && item.rating.score ? item.rating.score : 0,
+    date: '', 
+    overview: item.evaluate || item.brief || "暂无简介",
+    link: `https://www.bilibili.com/bangumi/play/ss${item.season_id}`,
+    epStatus: item.new_ep?.index_show || ''
+  }));
+
+  // 去重：如果 Bilibili 中存在同名番剧，则移除 TMDB 中的对应条目，优先展示 Bilibili 数据（带进度）
+  const bilibiliTitles = new Set(bilibiliMapped.map(item => item.title));
+  animeList = animeList.filter(item => !bilibiliTitles.has(item.title));
+
+  animeList = [...animeList, ...bilibiliMapped];
+}
+
+// 统计数据
+const totalCount = animeList.length;
+// 计算 TMDB 平均分 (使用原始 TMDB 数据，避免 Bilibili 数据拉低评分)
+const tmdbItems = animeData.flatMap((group) => group.items || []);
+const averageRating = tmdbItems.length > 0 
+  ? (tmdbItems.reduce((sum, item) => sum + (Number(item.vote_average) || 0), 0) / tmdbItems.length).toFixed(1) 
+  : "0.0";
+---
+
+<BaseLayout title="追番列表" isIndexed={false}>
+  <!-- 页面头部 -->
+  <div class="mb-8 animate-fade-in-up relative z-10">
+    <h1 class="text-3xl md:text-4xl font-bold mb-4 flex items-center gap-3">
+      <Icon name="lucide:tv" class="text-primary" />
+      <span>追番列表</span>
+    </h1>
+    
+    <!-- 统计卡片 -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+      <div class="stats shadow bg-base-100 border border-base-200">
+        <div class="stat p-4">
+          <div class="stat-figure text-primary">
+            <Icon name="lucide:film" class="w-8 h-8" />
+          </div>
+          <div class="stat-title">总追番</div>
+          <div class="stat-value text-primary">{totalCount}</div>
+          <div class="stat-desc">部作品</div>
+        </div>
+      </div>
+      
+      <div class="stats shadow bg-base-100 border border-base-200">
+        <div class="stat p-4">
+          <div class="stat-figure text-secondary">
+            <Icon name="lucide:star" class="w-8 h-8" />
+          </div>
+          <div class="stat-title">平均评分</div>
+          <div class="stat-value text-secondary">{averageRating}</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 筛选工具栏 -->
+    <div class="flex flex-col md:flex-row gap-4 bg-base-100 p-4 rounded-2xl shadow-sm border border-base-200 relative z-40">
+      <div class="flex-1 relative">
+        <Icon name="lucide:search" class="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-base-content/50" />
+        <input 
+          type="text" 
+          id="search-input" 
+          placeholder="搜索番剧..." 
+          class="input input-bordered w-full pl-10 focus:input-primary"
+        />
+      </div>
+      
+      <div class="flex gap-2 flex-wrap items-center">
+        <!-- 类型筛选 -->
+        <div class="dropdown dropdown-bottom dropdown-end">
+          <div tabindex="0" role="button" id="type-filter-btn" class="btn btn-outline m-1 w-full md:w-auto justify-between min-w-[120px]">
+            <span>全部类型</span>
+            <Icon name="lucide:chevron-down" class="w-4 h-4 ml-2" />
+          </div>
+          <ul tabindex="0" id="type-filter-menu" class="dropdown-content z-[50] menu p-2 shadow bg-base-100 rounded-box w-52">
+            <li><a data-value="all" class="active bg-primary text-primary-content hover:bg-primary hover:text-primary-content">全部类型</a></li>
+            <li><a data-value="tv" class="hover:bg-primary hover:text-primary-content">TV 动画</a></li>
+            <li><a data-value="movie" class="hover:bg-primary hover:text-primary-content">剧场版</a></li>
+          </ul>
+        </div>
+        
+        <!-- 排序筛选 -->
+        <div class="dropdown dropdown-bottom dropdown-end">
+          <div tabindex="0" role="button" id="sort-filter-btn" class="btn btn-outline m-1 w-full md:w-auto justify-between min-w-[120px]">
+            <span>评分最高</span>
+            <Icon name="lucide:chevron-down" class="w-4 h-4 ml-2" />
+          </div>
+          <ul tabindex="0" id="sort-filter-menu" class="dropdown-content z-[50] menu p-2 shadow bg-base-100 rounded-box w-52">
+            <li><a data-value="rating-desc" class="active bg-primary text-primary-content hover:bg-primary hover:text-primary-content">评分最高</a></li>
+            <li><a data-value="rating-asc" class="hover:bg-primary hover:text-primary-content">评分最低</a></li>
+            <li><a data-value="date-desc" class="hover:bg-primary hover:text-primary-content">最新发布</a></li>
+            <li><a data-value="date-asc" class="hover:bg-primary hover:text-primary-content">最早发布</a></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 番剧列表 -->
+  <div id="anime-grid" class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4 md:gap-6">
+    {
+      animeList.map((anime) => (
+        <div 
+          class="anime-card group relative h-full"
+          data-title={anime.title.toLowerCase()}
+          data-type={anime.type}
+          data-rating={anime.rating}
+          data-date={anime.date}
+        >
+          <Card class="h-full hover:shadow-xl transition-all duration-300 hover:-translate-y-1 overflow-hidden border border-base-200">
+            <a href={anime.link} target="_blank" rel="noopener noreferrer" class="block h-full flex flex-col">
+              <!-- 封面图容器 -->
+              <div class="relative aspect-[2/3] overflow-hidden bg-base-200">
+                {anime.poster ? (
+                  <img
+                    src={anime.poster}
+                    alt={anime.title}
+                    class="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                ) : (
+                  <div class="w-full h-full flex items-center justify-center text-base-content/30">
+                    <Icon name="lucide:image-off" class="w-12 h-12" />
+                  </div>
+                )}
+                
+                {/* 评分角标 - 仅在有评分时显示 */}
+                {anime.rating > 0 && (
+                  <div class="absolute top-2 right-2 bg-black/60 backdrop-blur-sm text-yellow-400 px-2 py-1 rounded-xl flex items-center gap-1 text-xs font-bold shadow-lg">
+                    <Icon name="lucide:star" class="w-3 h-3 fill-current" />
+                    <span>{anime.rating.toFixed(1)}</span>
+                  </div>
+                )}
+
+                {/* 类型角标 */}
+                <div class="absolute top-2 left-2 backdrop-blur-sm text-white px-2 py-1 rounded-xl text-xs font-bold shadow-lg bg-primary/80">
+                  {anime.type === 'movie' ? '剧场版' : 'TV'}
+                </div>
+
+                <!-- 悬停遮罩 -->
+                <div class="absolute inset-0 bg-black/80 opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex flex-col justify-center items-center p-4 text-center">
+                  <p class="text-white text-sm line-clamp-6 mb-4 leading-relaxed">
+                    {anime.overview || "暂无简介"}
+                  </p>
+                  <span class="btn btn-sm btn-primary btn-outline text-white border-white hover:bg-white hover:text-black hover:border-white gap-2">
+                    <Icon name="lucide:external-link" class="w-4 h-4" />
+                    查看详情
+                  </span>
+                </div>
+              </div>
+
+              <!-- 信息区域 -->
+              <div class="p-3 flex-1 flex flex-col bg-base-100">
+                <h2 class="font-bold text-base mb-1 line-clamp-1 group-hover:text-primary transition-colors" title={anime.title}>
+                  {anime.title}
+                </h2>
+                <div class="flex items-center justify-between mt-auto text-xs text-base-content/60">
+                  <span class="flex items-center gap-1">
+                    {anime.source === 'bilibili' && anime.epStatus ? (
+                      <>
+                        <Icon name="lucide:play-circle" class="w-3 h-3" />
+                        {anime.epStatus}
+                      </>
+                    ) : (
+                      <>
+                        <Icon name="lucide:calendar" class="w-3 h-3" />
+                        {anime.date ? anime.date.split('-')[0] : '未知'}
+                      </>
+                    )}
+                  </span>
+                  <span class="flex items-center gap-1">
+                    <Icon name="lucide:heart" class="w-3 h-3" />
+                    {anime.source === 'bilibili' ? 'Bilibili' : 'TMDB'}
+                  </span>
+                </div>
+              </div>
+            </a>
+          </Card>
+        </div>
+      ))
+    }
+  </div>
+
+  <!-- 无结果提示 -->
+  <div id="no-results" class="hidden flex-col items-center justify-center py-20 text-base-content/50">
+    <Icon name="lucide:search-x" class="w-16 h-16 mb-4" />
+    <p class="text-lg">没有找到匹配的番剧</p>
+  </div>
+
+  <!-- 分页控件 -->
+  <div id="pagination" class="flex items-center justify-center gap-2 mt-8 flex-wrap">
+    <button id="btn-prev" class="btn btn-sm btn-outline" disabled>← 上一页</button>
+    <div id="page-numbers" class="flex items-center gap-1"></div>
+    <button id="btn-next" class="btn btn-sm btn-outline">下一页 →</button>
+    <input id="page-jump" type="number" min="1" class="input input-sm input-bordered w-16 text-center font-mono text-xs" placeholder="回车跳转" />
+  </div>
+
+  <div class="divider my-6 animate-fade-in-up" style="animation-delay: 0.1s;">
+    <Icon name="lucide:heart" class="w-12 h-12 text-primary/50" />
+  </div>
+
+  <script>
+    function getCols() {
+      const w = window.innerWidth;
+      if (w >= 1280) return 5;
+      if (w >= 1024) return 4;
+      if (w >= 768) return 3;
+      return 2;
+    }
+
+    function getItemsPerPage() { return getCols() * 4; }
+
+    document.addEventListener('astro:page-load', () => {
+      const searchInput = document.getElementById('search-input') as HTMLInputElement;
+
+      let currentTypeValue = 'all';
+      let currentSortValue = 'rating-desc';
+      let currentPage = 1;
+
+      const typeFilterBtn = document.getElementById('type-filter-btn');
+      const typeFilterMenu = document.getElementById('type-filter-menu');
+      const sortFilterBtn = document.getElementById('sort-filter-btn');
+      const sortFilterMenu = document.getElementById('sort-filter-menu');
+      const grid = document.getElementById('anime-grid');
+      const noResults = document.getElementById('no-results');
+      const pagination = document.getElementById('pagination');
+      const pageNumbers = document.getElementById('page-numbers');
+      const pageJump = document.getElementById('page-jump') as HTMLInputElement;
+      const btnPrev = document.getElementById('btn-prev') as HTMLButtonElement;
+      const btnNext = document.getElementById('btn-next') as HTMLButtonElement;
+
+      if (!grid || !searchInput || !typeFilterBtn || !sortFilterBtn) return;
+
+      const cards = Array.from(grid.getElementsByClassName('anime-card')) as HTMLElement[];
+      let filteredCards: HTMLElement[] = [...cards];
+
+      function goToPage(page: number) {
+        currentPage = page;
+        renderPage();
+      }
+
+      function renderPage() {
+        const perPage = getItemsPerPage();
+        const totalPages = Math.max(1, Math.ceil(filteredCards.length / perPage));
+        if (currentPage > totalPages) currentPage = totalPages;
+
+        // Show/hide items
+        const start = (currentPage - 1) * perPage;
+        const end = start + perPage;
+        filteredCards.forEach((card, i) => {
+          card.style.display = (i >= start && i < end) ? '' : 'none';
+        });
+
+        // Update pagination controls
+        if (btnPrev) btnPrev.disabled = currentPage <= 1;
+        if (btnNext) btnNext.disabled = currentPage >= totalPages;
+
+        // Render page numbers
+        if (pageNumbers) {
+          const pages: number[] = [];
+          const maxBtns = 7;
+          if (totalPages <= maxBtns) {
+            for (let i = 1; i <= totalPages; i++) pages.push(i);
+          } else {
+            pages.push(1);
+            if (currentPage > 3) pages.push(-1); // ellipsis
+            const s = Math.max(2, currentPage - 1);
+            const e = Math.min(totalPages - 1, currentPage + 1);
+            for (let i = s; i <= e; i++) pages.push(i);
+            if (currentPage < totalPages - 2) pages.push(-1);
+            pages.push(totalPages);
+          }
+
+          pageNumbers.innerHTML = pages.map(p => {
+            if (p === -1) return '<span class="px-1 text-base-content/30">…</span>';
+            return `<button class="btn btn-sm ${p === currentPage ? 'btn-primary' : 'btn-outline'} w-10" data-page="${p}">${p}</button>`;
+          }).join('');
+
+          // Bind page button clicks (use data-page to avoid index mismatches)
+          pageNumbers.querySelectorAll('button').forEach(btn => {
+            btn.addEventListener('click', () => {
+              const num = parseInt(btn.dataset.page || '0');
+              if (num > 0) goToPage(num);
+            });
+          });
+        }
+
+        // Show/hide pagination
+        if (pagination) pagination.style.display = totalPages <= 1 ? 'none' : '';
+        if (noResults) noResults.style.display = filteredCards.length === 0 ? 'flex' : 'none';
+      }
+
+      function filterAndSort() {
+        const searchTerm = searchInput.value.toLowerCase();
+        const typeValue = currentTypeValue;
+        const sortValue = currentSortValue;
+
+        // Filter
+        filteredCards = cards.filter(card => {
+          const title = card.dataset.title || '';
+          const type = card.dataset.type || '';
+          return title.includes(searchTerm) && (typeValue === 'all' || type === typeValue);
+        });
+
+        // Sort
+        filteredCards.sort((a, b) => {
+          const ratingA = parseFloat(a.dataset.rating || '0');
+          const ratingB = parseFloat(b.dataset.rating || '0');
+          const dateA = a.dataset.date || '';
+          const dateB = b.dataset.date || '';
+          switch (sortValue) {
+            case 'rating-desc': return ratingB - ratingA;
+            case 'rating-asc': return ratingA - ratingB;
+            case 'date-desc': return dateB.localeCompare(dateA);
+            case 'date-asc': return dateA.localeCompare(dateB);
+            default: return 0;
+          }
+        });
+
+        // Reorder DOM
+        filteredCards.forEach(card => grid?.appendChild(card));
+
+        // Reset to page 1 and render
+        currentPage = 1;
+        renderPage();
+      }
+
+      // Bind events
+      searchInput.addEventListener('input', filterAndSort);
+
+      if (btnPrev) btnPrev.addEventListener('click', () => { if (currentPage > 1) goToPage(currentPage - 1); });
+      if (btnNext) btnNext.addEventListener('click', () => {
+        const total = Math.ceil(filteredCards.length / getItemsPerPage());
+        if (currentPage < total) goToPage(currentPage + 1);
+      });
+      if (pageJump) {
+        pageJump.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') {
+            const num = parseInt(pageJump.value);
+            const total = Math.ceil(filteredCards.length / getItemsPerPage());
+            if (num >= 1 && num <= total) goToPage(num);
+            pageJump.value = '';
+          }
+        });
+      }
+
+      // Window resize → recalculate items per page
+      let resizeTimer: ReturnType<typeof setTimeout>;
+      window.addEventListener('resize', () => {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(renderPage, 150);
+      });
+
+      // Type filter
+      typeFilterMenu?.querySelectorAll('a').forEach(item => {
+        item.addEventListener('click', (e) => {
+          const target = e.currentTarget as HTMLElement;
+          const value = target.dataset.value;
+          const text = target.innerText;
+          if (value) {
+            currentTypeValue = value;
+            const span = typeFilterBtn.querySelector('span');
+            if (span) span.innerText = text;
+            typeFilterMenu.querySelectorAll('a').forEach(a => a.classList.remove('active', 'bg-primary', 'text-primary-content'));
+            target.classList.add('active', 'bg-primary', 'text-primary-content');
+            (document.activeElement as HTMLElement)?.blur();
+            filterAndSort();
+          }
+        });
+      });
+
+      // Sort filter
+      sortFilterMenu?.querySelectorAll('a').forEach(item => {
+        item.addEventListener('click', (e) => {
+          const target = e.currentTarget as HTMLElement;
+          const value = target.dataset.value;
+          const text = target.innerText;
+          if (value) {
+            currentSortValue = value;
+            const span = sortFilterBtn.querySelector('span');
+            if (span) span.innerText = text;
+            sortFilterMenu.querySelectorAll('a').forEach(a => a.classList.remove('active', 'bg-primary', 'text-primary-content'));
+            target.classList.add('active', 'bg-primary', 'text-primary-content');
+            (document.activeElement as HTMLElement)?.blur();
+            filterAndSort();
+          }
+        });
+      });
+
+      // Initial render
+      filterAndSort();
+    });
+  </script>
+</BaseLayout>

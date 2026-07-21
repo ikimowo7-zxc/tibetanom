@@ -1,0 +1,101 @@
+---
+interface Props {
+  serverURL: string;
+  lang?: string;
+  dark?: string;
+  emoji?: string[];
+  meta?: string[];
+  requiredMeta?: string[];
+  reaction?: boolean;
+  pageview?: boolean;
+}
+
+const {
+  serverURL,
+  lang = "en",
+  dark = "html[data-theme-type='dark']",
+  emoji = [
+    "https://unpkg.com/@waline/emojis@1.1.0/weibo",
+    "https://unpkg.com/@waline/emojis@1.1.0/bilibili",
+  ],
+  meta = ["nick", "mail", "link"],
+  requiredMeta = [],
+  reaction = false,
+  pageview = false,
+} = Astro.props;
+---
+
+<div
+  id="waline-container"
+  data-server-url={serverURL}
+  data-lang={lang}
+  data-dark={dark}
+  data-emoji={JSON.stringify(emoji)}
+  data-meta={JSON.stringify(meta)}
+  data-required-meta={JSON.stringify(requiredMeta)}
+  data-reaction={reaction ? "true" : "false"}
+  data-pageview={pageview ? "true" : "false"}
+>
+</div>
+
+<link
+  rel="stylesheet"
+  href="https://unpkg.com/@waline/client@v3/dist/waline.css"
+/>
+
+<script is:inline>
+  let walineInstance;
+
+  async function mountWaline() {
+    const container = document.getElementById("waline-container");
+    if (!container) return;
+
+    const serverURL = container.dataset.serverUrl;
+    const lang = container.dataset.lang || "zh";
+    const dark = container.dataset.dark;
+    const emoji = JSON.parse(container.dataset.emoji || "[]");
+    const meta = JSON.parse(container.dataset.meta || "[]");
+    const requiredMeta = JSON.parse(container.dataset.requiredMeta || "[]");
+    const reaction = container.dataset.reaction === "true";
+    const pageview = container.dataset.pageview === "true";
+
+    if (walineInstance) {
+      await walineInstance.destroy();
+    }
+    const { init } = await import(
+      "https://unpkg.com/@waline/client@v3/dist/waline.js"
+    );
+    walineInstance = init({
+      el: "#waline-container",
+      serverURL,
+      path: location.pathname,
+      lang,
+      dark,
+      emoji,
+      meta,
+      requiredMeta,
+      reaction,
+      pageview,
+    });
+  }
+
+  document.addEventListener("astro:after-swap", () => {
+    mountWaline();
+  });
+
+  document.addEventListener("DOMContentLoaded", () => {
+    mountWaline();
+  });
+
+  // 兜底：脚本执行时 DOM 已就绪，直接挂载
+  if (document.readyState !== "loading") {
+    mountWaline();
+  }
+</script>
+
+<style>
+  #waline-container {
+    margin-top: 2rem;
+    margin-bottom: 2rem;
+  }
+</style>

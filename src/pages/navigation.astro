@@ -1,0 +1,16 @@
+---
+import BaseLayout from "@layouts/BaseLayout.astro";
+import { Icon } from "astro-icon/components";
+import { loadNavigation } from "@/lib/load-navigation";
+import NavEditPage from "@/components/write/NavEditPage";
+
+const navData = loadNavigation();
+---
+
+<BaseLayout title="导航" isIndexed={false}>
+  <NavEditPage client:only="react" initialNavData={navData} />
+
+  <div class="divider my-6 animate-fade-in-up" style="animation-delay: 0.1s;">
+    <Icon name="lucide:heart" class="w-12 h-12 text-primary/50" />
+  </div>
+</BaseLayout>
